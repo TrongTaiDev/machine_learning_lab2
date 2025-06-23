@@ -13,22 +13,38 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, ExtraTreesClassifier
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from scipy import stats
 import numpy as np
 import holidays
 import matplotlib.pyplot as plt
 from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import GridSearchCV
 
 def read_data(filepath: str) -> pd.DataFrame:
     df = pd.read_csv(filepath, parse_dates=["Date"], date_format='%m-%d-%y', low_memory=False)
 
     # Trim khoảng trắng cho tên các cột
     df.columns = df.columns.str.strip()
+    
+    # Loại bỏ các cột không có giá trị trong việc dự đoán doanh thu
+    columns_to_remove = [
+        'index', 'Order ID', 'Unnamed: 22'
+    ]
+    
+    # Chỉ loại bỏ các cột thực sự tồn tại
+    existing_columns_to_remove = [col for col in columns_to_remove if col in df.columns]
+    if existing_columns_to_remove:
+        df = df.drop(columns=existing_columns_to_remove)
 
     # Ép kiểu cơ bản
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
     df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0).astype(int)
+    
+    # Loại bỏ các dòng có Amount = 0
+    df = df[df["Amount"] != 0]
 
     # Điền giá trị NaN bằng giá trị trung bình cho các cột số
     numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
@@ -52,211 +68,361 @@ def summarize_data(df: pd.DataFrame):
     print(df.dtypes)
     print()
 
-    print("Số lượng giá trị thiếu:")
-    print(df.isnull().sum()[df.isnull().sum() > 0])
-    print()
+    if 'Amount' in df.columns:
+        print("Thống kê chi tiết cột Amount:")
+        print(f"- Giá trị nhỏ nhất (min): {df['Amount'].min():.2f}")
+        print(f"- Giá trị lớn nhất (max): {df['Amount'].max():.2f}")
+        print(f"- Giá trị trung bình (mean): {df['Amount'].mean():.2f}")
 
-    print("Các cột phân loại (categorical) phổ biến:")
-    categorical_cols = df.select_dtypes(include='object').columns
-    for col in categorical_cols:
-        print(f"- {col}: {df[col].nunique()} giá trị (top: {df[col].value_counts().idxmax()})")
-
-    print()
-
-    print("Các cột số (numeric) cơ bản:")
-    numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
-    print(df[numeric_cols].describe().T)
-
-def prepare_features(df: pd.DataFrame, drop_first: bool = True) -> pd.DataFrame:
-    df = df.copy()
+def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
+    df_engineered = df.copy()
 
     # Nhóm đặc trưng thời gian
-    df["day"] = df["Date"].dt.day
-    df["year"] = df["Date"].dt.year
-    df["month"] = df["Date"].dt.month
-    df["weekday"] = df["Date"].dt.dayofweek
-    df["week"] = df["Date"].dt.isocalendar().week
-    df["is_weekend"] = df["weekday"].isin([5, 6]).astype(int)  # 5=Saturday, 6=Sunday
-    season_map = {
-        12: 'Winter', 1: 'Winter', 2: 'Winter',  # Winter: Dec, Jan, Feb
-        3: 'Spring', 4: 'Spring', 5: 'Spring',    # Spring: Mar, Apr, May
-        6: 'Summer', 7: 'Summer', 8: 'Summer',    # Summer: Jun, Jul, Aug
-        9: 'Fall', 10: 'Fall', 11: 'Fall'         # Fall: Sep, Oct, Nov
-    }
-    df["season"] = df["month"].map(season_map)
+    df_engineered["day"] = df_engineered["Date"].dt.day
+    df_engineered["year"] = df_engineered["Date"].dt.year
+    df_engineered["month"] = df_engineered["Date"].dt.month
+    df_engineered["weekday"] = df_engineered["Date"].dt.dayofweek
+    df_engineered["is_weekend"] = df_engineered["weekday"].isin([5, 6]).astype(int)
+
     us_holidays = holidays.US()
-    df["is_holiday"] = df["Date"].apply(lambda x: x in us_holidays).astype(int)
-    df["holiday_name"] = df["Date"].apply(lambda x: us_holidays.get(x, "Not Holiday"))
+    df_engineered["is_holiday"] = df_engineered["Date"].apply(lambda x: x in us_holidays).astype(int)
+    df_engineered["promotion_applied"] = df_engineered["promotion-ids"].notnull().astype(int)
+    df_engineered["b2b_flag"] = df['B2B'].astype(str).str.upper().map({"TRUE": 1, "FALSE": 0}).fillna(0).astype(int)
+    sku_counts = df_engineered['SKU'].value_counts()
+    df_engineered['sku_popularity'] = df_engineered['SKU'].map(sku_counts)
+    category_counts = df_engineered['Category'].value_counts()
+    df_engineered['category_popularity'] = df_engineered['Category'].map(category_counts)
+    df_engineered['order_size_bucket'] = pd.cut(
+        df['Qty'],
+        bins=[-1, 1, 5, float('inf')],
+        labels=['small', 'medium', 'large']
+    ).astype(str)
     
-    # Nhóm đặc trưng khuyến mãi
-    df["promotion_applied"] = df["promotion-ids"].notnull().astype(int)
-    df["qty_x_promo"] = df["Qty"] * df["promotion_applied"]
-    
-    # Nhóm đặc trưng giá cả
-    df["price_per_unit"] = df["Amount"] / df["Qty"]  # Giá trung bình trên mỗi đơn vị
-    df["price_per_unit"] = df["price_per_unit"].replace([np.inf, -np.inf], np.nan)  # Xử lý chia cho 0
-    df["price_per_unit"] = df["price_per_unit"].fillna(df["price_per_unit"].mean())  # Điền giá trị trung bình
-    df["price_promo"] = df["price_per_unit"] * df["promotion_applied"]
-    df["price_season"] = df["price_per_unit"] * df["month"].map(lambda x: 1 if x in [12, 1, 2] else  # Winter
-                                                                    2 if x in [3, 4, 5] else  # Spring
-                                                                    3 if x in [6, 7, 8] else  # Summer
-                                                                    4)  # Fall
-    # Nhóm đặc trưng giá tương tác
-    df["season_holiday"] = df["season"] + "_" + df["holiday_name"]
-    df["promo_holiday"] = df["promotion_applied"].astype(str) + "_" + df["holiday_name"]
-    
-    # Nhóm đặc trưng theo sản phẩm
-    sku_avg_sales = df.groupby('SKU')['Amount'].transform('mean')
-    df['sku_avg_sales'] = sku_avg_sales.fillna(df['Amount'].mean())  # Điền giá trị trung bình chung nếu không có dữ liệu SKU
-    category_avg_sales = df.groupby('Category')['Amount'].transform('mean')
-    df['category_avg_sales'] = category_avg_sales.fillna(df['Amount'].mean())  # Điền giá trị trung bình chung nếu không có dữ liệu Category
-    
-    # Tính tỷ lệ doanh thu của SKU so với trung bình Category
-    df['sku_to_category_ratio'] = df['sku_avg_sales'] / df['category_avg_sales']
-    df['sku_to_category_ratio'] = df['sku_to_category_ratio'].replace([np.inf, -np.inf], 1.0)  # Xử lý chia cho 0
-    df['sku_to_category_ratio'] = df['sku_to_category_ratio'].fillna(1.0)  # Điền 1.0 nếu không có dữ liệu
-    
-    # Nhóm đặc trưng theo xu hướng ngắn hạn
-    df['sku_rolling_avg_30d'] = df.groupby('SKU')['Amount'].transform(
-        lambda x: x.rolling(window=30, min_periods=1).mean()
-    )
-    df['sku_rolling_avg_30d'] = df['sku_rolling_avg_30d'].fillna(df['sku_avg_sales'])  # Điền bằng trung bình SKU nếu không có dữ liệu 30 ngày
-    
-    # Tính doanh thu trung bình theo Category trong 30 ngày gần nhất
-    df['category_rolling_avg_30d'] = df.groupby('Category')['Amount'].transform(
-        lambda x: x.rolling(window=30, min_periods=1).mean()
-    )
-    df['category_rolling_avg_30d'] = df['category_rolling_avg_30d'].fillna(df['category_avg_sales'])  # Điền bằng trung bình Category nếu không có dữ liệu 30 ngày
-    
-    # Tính tỷ lệ doanh thu hiện tại so với trung bình 30 ngày của SKU
-    df['sku_sales_trend'] = df['Amount'] / df['sku_rolling_avg_30d']
-    df['sku_sales_trend'] = df['sku_sales_trend'].replace([np.inf, -np.inf], 1.0)  # Xử lý chia cho 0
-    df['sku_sales_trend'] = df['sku_sales_trend'].fillna(1.0)  # Điền 1.0 nếu không có dữ liệu
-    
-    # Tính tỷ lệ doanh thu hiện tại so với trung bình 30 ngày của Category
-    df['category_sales_trend'] = df['Amount'] / df['category_rolling_avg_30d']
-    df['category_sales_trend'] = df['category_sales_trend'].replace([np.inf, -np.inf], 1.0)  # Xử lý chia cho 0
-    df['category_sales_trend'] = df['category_sales_trend'].fillna(1.0)  # Điền 1.0 nếu không có dữ liệu
-
-    df_model = df.copy()
-    # One-hot encode các cột phân loại và xử lý NaN
-    df_model = pd.get_dummies(df_model, 
-                            columns=["Category", "Sales Channel", "fulfilled-by", "ship-country", 
-                                   "season", "holiday_name", "season_holiday", "promo_holiday"], 
-                            drop_first=drop_first,
-                            dummy_na=True)  # Thêm cột cho giá trị NaN
-    
-    return df_model
-
-def forecast_sales_with_linear_regression(df: pd.DataFrame, print_top_features: bool = False):
-    #DỰ BÁO DOANH THU THEO THỜI GIAN
-    df = df.dropna(subset=["Amount"])
-    
-    # Lấy tất cả các cột sau khi one-hot encoding
-    time_features = ["day", "year", "month", "weekday", "week", "is_weekend", "is_holiday"]
-    product_features = ["Qty", "promotion_applied", "qty_x_promo", "price_per_unit", "price_promo"]
-    category_features = [col for col in df.columns if col.startswith("Category_")]
-    sales_channel_features = [col for col in df.columns if col.startswith("Sales Channel_")]
-    season_features = [col for col in df.columns if col.startswith("season_")]
-    holiday_features = [col for col in df.columns if col.startswith("holiday_name_")]
-    season_holiday_features = [col for col in df.columns if col.startswith("season_holiday_")]
-    promo_holiday_features = [col for col in df.columns if col.startswith("promo_holiday_")]
-    price_season_features = ["price_season"]
-    
-    # Thêm features mới về doanh thu
-    sales_features = [
-        "sku_avg_sales", "category_avg_sales", "sku_to_category_ratio",
-        "sku_rolling_avg_30d", "category_rolling_avg_30d",
-        "sku_sales_trend", "category_sales_trend"
+    features_to_remove = [
+        'Date', 'promotion-ids', 'B2B', 'SKU', 'Category'
     ]
+
+    existing_features_to_remove = [col for col in features_to_remove if col in df_engineered.columns]
+    if existing_features_to_remove:
+        df_engineered = df_engineered.drop(columns=existing_features_to_remove)
+
+    print(f"Created {len([col for col in df_engineered.columns if col not in df.columns])} new engineered features.")
+    print(f"Removed {len(features_to_remove)} original features.")
+    print(f"Total features after engineering: {len(df_engineered.columns)}")
+
+    return df_engineered
+
+
+def handle_outliers(df, z_threshold=3.45):
+    df_cleaned = df.copy()
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
     
-    features = (time_features + product_features + category_features + 
-               sales_channel_features + season_features + holiday_features + 
-               season_holiday_features + promo_holiday_features + price_season_features +
-               sales_features)
+    # Don't handle outliers in target variable if it exists
+    if 'Amount' in numeric_cols:
+        numeric_cols = numeric_cols.drop('Amount')
     
-    X = df[features]
-    y = df["Amount"]
+    # Handle outliers in each numerical column
+    for col in numeric_cols:
+        # Skip if standard deviation is too small
+        if df[col].std() < 1e-10:
+            continue
+        # Calculate z-scores with error handling
+        try:
+            z_scores = np.abs(stats.zscore(df[col]))
+            df_cleaned[col] = df[col].mask(z_scores > z_threshold, df[col].mean())
+        except:
+            # If z-score calculation fails, skip this column
+            continue
+    
+    return df_cleaned
+
+def encode_categorical(df):
+    df_encoded = df.copy()
+    categorical_cols = df.select_dtypes(include=['object']).columns
+    
+    # Encode each categorical column
+    for col in categorical_cols:
+        le = LabelEncoder()
+        df_encoded[col] = le.fit_transform(df[col])
+    
+    return df_encoded
+
+
+def encode_categorical(df):
+    """
+    Encode categorical variables using LabelEncoder
+    
+    Args:
+        df (pandas.DataFrame): Input dataframe
+        
+    Returns:
+        pandas.DataFrame: DataFrame with encoded categorical variables
+    """
+    df_encoded = df.copy()
+    categorical_cols = df.select_dtypes(include=['object']).columns
+    
+    # Encode each categorical column
+    for col in categorical_cols:
+        le = LabelEncoder()
+        df_encoded[col] = le.fit_transform(df[col])
+    
+    return df_encoded
+
+def normalize_data(df):
+    """
+    Normalize numerical data using StandardScaler
+    
+    Args:
+        df (pandas.DataFrame): Input dataframe
+        
+    Returns:
+        pandas.DataFrame: DataFrame with normalized numerical variables
+    """
+    df_normalized = df.copy()
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    
+    # Don't normalize target variable if it exists
+    if 'Amount' in numeric_cols:
+        numeric_cols = numeric_cols.drop('Amount')
+    
+    # Normalize each numerical column
+    scaler = MinMaxScaler()
+    df_normalized[numeric_cols] = scaler.fit_transform(df[numeric_cols])
+    
+    return df_normalized
+
+def feature_importance(df: pd.DataFrame, importance_threshold: float = 0.95):
+    if 'Amount' not in df.columns:
+        raise ValueError("Input DataFrame must contain 'Amount' column.")
+
+    # --- 1. Train Model to Get Importance Scores ---
+    X = df.drop('Amount', axis=1)
+    y = df['Amount']
+
+    # Using RandomForestRegressor for proper regression feature importance
+    from sklearn.ensemble import RandomForestRegressor
+    model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+    model.fit(X, y)
+
+    # --- 2. Create Importance DataFrame ---
+    importance_df = pd.DataFrame({
+        'Feature': X.columns,
+        'Importance': model.feature_importances_
+    }).sort_values('Importance', ascending=False)
+    
+    print("Feature Importance Ranking:")
+    print(importance_df.to_string(index=False))
+    print()
+
+    # Calculate cumulative importance
+    importance_df['Cumulative_Importance'] = importance_df['Importance'].cumsum()
+
+    # --- 3. Select Features Based on Threshold ---
+    # Find features that contribute to the threshold
+    selected_features = importance_df[importance_df['Cumulative_Importance'] <= importance_threshold]
+    
+    # If no features meet the threshold, select at least the top feature
+    if selected_features.empty:
+        selected_features = importance_df.head(1)
+    # If the top feature already exceeds threshold, still include it
+    elif importance_df.iloc[0]['Cumulative_Importance'] > importance_threshold:
+        selected_features = importance_df.head(1)
+        
+    # --- 4. Print Report and Prepare Final DataFrame ---
+    print("="*60)
+    print("         FEATURE IMPORTANCE & SELECTION REPORT")
+    print("="*60)
+    print(f"Model used for selection: RandomForestRegressor")
+    print(f"Selection threshold (cumulative importance): {importance_threshold}")
+    print("-"*60)
+    print(f"Total features analyzed: {len(X.columns)}")
+    print(f"Features selected: {len(selected_features)}")
+    print(f"Features removed: {len(X.columns) - len(selected_features)}")
+    print(f"Cumulative importance of selected features: {selected_features['Cumulative_Importance'].iloc[-1]:.4f}")
+    print("-"*60)
+    
+    print("Selected Features:")
+    for _, row in selected_features.iterrows():
+        print(f"  {row['Feature']}: {row['Importance']:.4f} (cumulative: {row['Cumulative_Importance']:.4f})")
+    
+    print("\nRemoved Features:")
+    removed_features = importance_df[~importance_df['Feature'].isin(selected_features['Feature'])]
+    for _, row in removed_features.iterrows():
+        print(f"  {row['Feature']}: {row['Importance']:.4f}")
+
+    # Get the list of feature names to keep and add the target variable back
+    features_to_keep = selected_features['Feature'].tolist()
+    features_to_keep.append('Amount')
+    
+    # Return the original DataFrame filtered to the selected features
+    df_filtered = df[features_to_keep]
+    print(f"\nReturning DataFrame with {len(df_filtered.columns)} columns.")
+    print("="*60 + "\n")
+
+    return df_filtered
+
+
+def grid_search_gradient_boosting(df: pd.DataFrame):
+    """
+    Perform Grid Search to find best hyperparameters for Gradient Boosting
+    Uses only 80% of data for grid search
+    
+    Args:
+        df (pd.DataFrame): Input dataframe with features and target
+        
+    Returns:
+        dict: Best parameters found
+    """
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.ensemble import GradientBoostingRegressor
+    
+    print("=== GRID SEARCH FOR GRADIENT BOOSTING (80% DATA) ===")
+    
+    # Prepare data
+    X = df.drop('Amount', axis=1)
+    y = df['Amount']
+    # Split data: 80% for grid search, 20% for final testing
+    X_grid, X_test, y_grid, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+   
+    # Define parameter grid
+    param_grid = {
+        'n_estimators': [100, 200, 300],
+        'learning_rate': [0.01, 0.05, 0.1, 0.2],
+        'max_depth': [3, 4, 5, 6],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'subsample': [0.8, 0.9, 1.0]
+    }
+    print("Parameter grid:")
+    for param, values in param_grid.items():
+        print(f"  {param}: {values}")
+    print()
+    
+    # Initialize base model
+    base_model = GradientBoostingRegressor(random_state=42)
+    
+    # Initialize GridSearchCV
+    grid_search = GridSearchCV(
+        estimator=base_model,
+        param_grid=param_grid,
+        cv=5,  # 5-fold cross-validation
+        scoring='neg_root_mean_squared_error',  # Use RMSE for regression
+        n_jobs=-1,  # Use all CPU cores
+        verbose=1
+    )
+    
+    # Fit the grid search on 80% of data
+    grid_search.fit(X_grid, y_grid)
+    
+    # Get best parameters and score
+    best_params = grid_search.best_params_
+    best_score = -grid_search.best_score_  # Convert back to positive MSE
+    best_rmse = np.sqrt(best_score)
+    
+    print("=== GRID SEARCH RESULTS (on 80% data) ===")
+    print(f"Best parameters: {best_params}")
+    print(f"Best MSE: {best_score:.4f}")
+    print(f"Best RMSE: {best_rmse:.4f}")
+    print()
+    
+    return best_params
+
+def grid_search_random_forest(df: pd.DataFrame):
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.ensemble import RandomForestRegressor
+    
+    print("=== GRID SEARCH FOR RANDOM FOREST (80% DATA) ===")
+    
+    # Prepare data
+    X = df.drop('Amount', axis=1)
+    y = df['Amount']
+    # Split data: 80% for grid search, 20% for final testing
+    X_grid, X_test, y_grid, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+   
+    # Define parameter grid for Random Forest
+    param_grid = {
+        'n_estimators': [100, 200, 300],
+        'max_depth': [5, 10, 15, None],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4]
+    }
+    
+    print("Parameter grid:")
+    for param, values in param_grid.items():
+        print(f"  {param}: {values}")
+    print()
+    
+    # Initialize base model
+    base_model = RandomForestRegressor(random_state=42, n_jobs=-1)
+    
+    # Initialize GridSearchCV
+    grid_search = GridSearchCV(
+        estimator=base_model,
+        param_grid=param_grid,
+        cv=5,  # 5-fold cross-validation
+        scoring='neg_root_mean_squared_error',  # Use MSE for regression
+        n_jobs=-1,  # Use all CPU cores
+        verbose=3
+    )
+    
+    # Fit the grid search on 80% of data
+    grid_search.fit(X_grid, y_grid)
+    
+    # Get best parameters and score
+    best_params = grid_search.best_params_
+    best_score = -grid_search.best_score_  # Convert back to positive MSE
+    best_rmse = np.sqrt(best_score)
+    
+    print("=== GRID SEARCH RESULTS (on 80% data) ===")
+    print(f"Best parameters: {best_params}")
+    print(f"Best MSE: {best_score:.4f}")
+    print(f"Best RMSE: {best_rmse:.4f}")
+    print()
+    
+    return best_params
+
+
+def predict_with_linear_regression(df: pd.DataFrame):
+    """
+    Improved Linear Regression with diagnostics and preprocessing
+    """
+    X = df.drop('Amount', axis=1)
+    y = df['Amount']
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    # In kích thước các tập dữ liệu
-    print("\nKích thước các tập dữ liệu sau khi tách:")
-    print(f"X_train shape: {X_train.shape}")
-    print(f"X_test shape: {X_test.shape}")
-    print(f"y_train shape: {y_train.shape}")
-    print(f"y_test shape: {y_test.shape}")
-    
-    # In một số mẫu đầu tiên của tập train
-    print("\nMẫu đầu tiên của tập train:")
-    print("X_train:")
-    print(X_train.head())
-    print("\ny_train:")
-    print(y_train.head())
-    
+
     model = LinearRegression()
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
+    
+    # Calculate metrics
     metrics = {
         "MAE": mean_absolute_error(y_test, y_pred),
         "MSE": mean_squared_error(y_test, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_test, y_pred)),
         "R2 Score": r2_score(y_test, y_pred)
     }
-    print("Linear Regression Metrics:")
-    print(metrics)
-    print()
-
-    if print_top_features:
-        # In tầm quan trọng của các features dựa trên coefficients
-        feature_importance = pd.DataFrame({
-            'feature': features,
-            'coefficient': np.abs(model.coef_)  # Lấy giá trị tuyệt đối của coefficients
-        }).sort_values('coefficient', ascending=False)
-        print("Top 5 Important Features (based on coefficients):")
-        print(feature_importance.head(5))
-        print()
     
+    print("=== LINEAR REGRESSION RESULTS ===")
+    print("Test Metrics:")
+    print(metrics)
+
     return model, metrics, X_train, X_test, y_train, y_test
     
-def forecast_sales_with_gradient_boosting(df, print_top_features: bool = False):
-    #DỰ BÁO DOANH THU THEO THỜI GIAN
-    # Loại bỏ bản ghi không có Amount
-    df = df.dropna(subset=["Amount"])
-    
-    # Lựa chọn các feature
-    time_features = ["day", "year", "month", "weekday", "week", "is_weekend", "is_holiday"]
-    product_features = ["Qty", "promotion_applied", "qty_x_promo", "price_per_unit", "price_promo"]
-    category_features = [col for col in df.columns if col.startswith("Category_")]
-    sales_channel_features = [col for col in df.columns if col.startswith("Sales Channel_")]
-    season_features = [col for col in df.columns if col.startswith("season_")]
-    holiday_features = [col for col in df.columns if col.startswith("holiday_name_")]
-    season_holiday_features = [col for col in df.columns if col.startswith("season_holiday_")]
-    promo_holiday_features = [col for col in df.columns if col.startswith("promo_holiday_")]
-    price_season_features = ["price_season"]
-    
-    # Thêm features mới về doanh thu
-    sales_features = [
-        "sku_avg_sales", "category_avg_sales", "sku_to_category_ratio",
-        "sku_rolling_avg_30d", "category_rolling_avg_30d",
-        "sku_sales_trend", "category_sales_trend"
-    ]
-    
-    features = (time_features + product_features + category_features + 
-               sales_channel_features + season_features + holiday_features + 
-               season_holiday_features + promo_holiday_features + price_season_features +
-               sales_features)
-    
-    X = df[features]
-    y = df["Amount"]
+def predict_with_gradient_boosting(df: pd.DataFrame):
+    X = df.drop('Amount', axis=1)
+    y = df['Amount']
     # Chia dữ liệu train/test
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
     # Khởi tạo mô hình Gradient Boosting
     model = GradientBoostingRegressor(
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=3,
+        n_estimators=300,
+        learning_rate=0.2,
+        max_depth=6,
+        min_samples_split=10,
+        min_samples_leaf=2,
+        subsample=1.0,
         random_state=42
     )
     # Huấn luyện mô hình
@@ -274,58 +440,20 @@ def forecast_sales_with_gradient_boosting(df, print_top_features: bool = False):
     print(metrics)
     print()
 
-    if print_top_features:
-        # In tầm quan trọng của các features
-        feature_importance = pd.DataFrame({
-            'feature': features,
-            'importance': model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        print("Top 5 Important Features:")
-        print(feature_importance.head(5))
-        print()
-
     return model, metrics, X_train, X_test, y_train, y_test
 
-def forecast_sales_with_random_forest(df: pd.DataFrame, print_top_features: bool = False):
-    #DỰ BÁO DOANH THU THEO THỜI GIAN
-    # Loại bỏ bản ghi không có Amount
-    df = df.dropna(subset=["Amount"])
-    
-    # Lấy tất cả các cột sau khi one-hot encoding
-    time_features = ["day", "year", "month", "weekday", "week", "is_weekend", "is_holiday"]
-    product_features = ["Qty", "promotion_applied", "qty_x_promo", "price_per_unit", "price_promo"]
-    category_features = [col for col in df.columns if col.startswith("Category_")]
-    sales_channel_features = [col for col in df.columns if col.startswith("Sales Channel_")]
-    season_features = [col for col in df.columns if col.startswith("season_")]
-    holiday_features = [col for col in df.columns if col.startswith("holiday_name_")]
-    season_holiday_features = [col for col in df.columns if col.startswith("season_holiday_")]
-    promo_holiday_features = [col for col in df.columns if col.startswith("promo_holiday_")]
-    price_season_features = ["price_season"]
-    
-    # Thêm features mới về doanh thu
-    sales_features = [
-        "sku_avg_sales", "category_avg_sales", "sku_to_category_ratio",
-        "sku_rolling_avg_30d", "category_rolling_avg_30d",
-        "sku_sales_trend", "category_sales_trend"
-    ]
-    
-    features = (time_features + product_features + category_features + 
-               sales_channel_features + season_features + holiday_features + 
-               season_holiday_features + promo_holiday_features + price_season_features +
-               sales_features)
-    
-    X = df[features]
-    y = df["Amount"]
-    
+def predict_with_random_forest(df: pd.DataFrame):
+    X = df.drop('Amount', axis=1)
+    y = df['Amount']
     # Chia dữ liệu train/test
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
     # Khởi tạo và huấn luyện mô hình Random Forest
     model = RandomForestRegressor(
-        n_estimators=100,  # Số lượng cây
-        max_depth=10,      # Độ sâu tối đa của mỗi cây
-        min_samples_split=5,  # Số lượng mẫu tối thiểu để chia node
-        min_samples_leaf=2,   # Số lượng mẫu tối thiểu ở lá
+        n_estimators=300,  # Số lượng cây
+        max_depth=None,      # Độ sâu tối đa của mỗi cây
+        min_samples_split=2,  # Số lượng mẫu tối thiểu để chia node
+        min_samples_leaf=1,   # Số lượng mẫu tối thiểu ở lá
         random_state=42
     )
     
@@ -348,69 +476,23 @@ def forecast_sales_with_random_forest(df: pd.DataFrame, print_top_features: bool
     print(metrics)
     print()
     
-    if print_top_features:
-        # In tầm quan trọng của các features
-        feature_importance = pd.DataFrame({
-            'feature': features,
-            'importance': model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        print("Top 5 Important Features:")
-        print(feature_importance.head(5))
-        print()
-    
     return model, metrics, X_train, X_test, y_train, y_test
-
-def check_overfitting(model, X_train, y_train, X_test, y_test, cv=5):
-    """
-    Đánh giá overfitting của mô hình:
-        - In R², MAE, RMSE trên cả train và test
-        - In Cross-validation R²
-        - Hiển thị biểu đồ so sánh y_test vs y_pred
-    """
-    # Train metrics
-    y_train_pred = model.predict(X_train)
-    r2_train = r2_score(y_train, y_train_pred)
-    mae_train = mean_absolute_error(y_train, y_train_pred)
-    rmse_train = np.sqrt(mean_squared_error(y_train, y_train_pred))
-
-    # Test metrics
-    y_test_pred = model.predict(X_test)
-    r2_test = r2_score(y_test, y_test_pred)
-    mae_test = mean_absolute_error(y_test, y_test_pred)
-    rmse_test = np.sqrt(mean_squared_error(y_test, y_test_pred))
-
-    # Cross-validation R2
-    cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='r2')
-    cv_r2_mean = np.mean(cv_scores)
-    cv_r2_std = np.std(cv_scores)
-
-    print(f"Train:    R2={r2_train:.4f}, MAE={mae_train:.4f}, RMSE={rmse_train:.4f}")
-    print(f"Test:     R2={r2_test:.4f}, MAE={mae_test:.4f}, RMSE={rmse_test:.4f}")
-    print(f"CV R2:    Mean={cv_r2_mean:.4f}, Std={cv_r2_std:.4f}")
-
-    # Plot y_test vs y_pred
-    plt.figure(figsize=(6,6))
-    plt.scatter(y_test, y_test_pred, alpha=0.5)
-    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
-    plt.xlabel('Actual y_test')
-    plt.ylabel('Predicted y_test')
-    plt.title('y_test vs y_pred')
-    plt.grid(True)
-    plt.show()
 
 def main():
     df = read_data("datasets/amazon_sale_report.csv")
-    summarize_data(df)
-    df_linear_regression = prepare_features(df, drop_first=True)
-    df_gradient_boosting = prepare_features(df, drop_first=False)
-    df_random_forest = prepare_features(df, drop_first=False)
-    # Dự đoán doanh thu theo thời gian
-    # model_lr, metrics_lr, X_train_lr, X_test_lr, y_train_lr, y_test_lr = forecast_sales_with_linear_regression(df_linear_regression, print_top_features=False)
-    # check_overfitting(model_lr, X_train_lr, y_train_lr, X_test_lr, y_test_lr)
-    # model_gb, metrics_gb, X_train_gb, X_test_gb, y_train_gb, y_test_gb = forecast_sales_with_gradient_boosting(df_gradient_boosting, print_top_features=False)
-    # check_overfitting(model_gb, X_train_gb, y_train_gb, X_test_gb, y_test_gb)
-    model_rf, metrics_rf, X_train_rf, X_test_rf, y_train_rf, y_test_rf = forecast_sales_with_random_forest(df_random_forest, print_top_features=False)
-    check_overfitting(model_rf, X_train_rf, y_train_rf, X_test_rf, y_test_rf)
+    df = prepare_features(df)          # 2. Tạo đặc trưng thủ công (dùng giá trị gốc chưa bị encode)
+    df = handle_outliers(df)            # 3. Xử lý ngoại lệ (trên các cột số gốc hoặc vừa tạo)
+    df = encode_categorical(df)         # 4. Mã hóa biến phân loại (LabelEncoder)
+    df = normalize_data(df)             # 5. Chuẩn hóa dữ liệu số
+    df = feature_importance(df, importance_threshold=0.99)
+
+    #Grid Search
+    best_params_gradient_boosting = grid_search_gradient_boosting(df)
+    best_params_random_forest = grid_search_random_forest(df)
+    
+    predict_with_linear_regression(df)
+    predict_with_gradient_boosting(df)
+    predict_with_random_forest(df)
 
 if __name__ == "__main__":
     main()
